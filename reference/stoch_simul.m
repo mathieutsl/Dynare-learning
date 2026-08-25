@@ -1,0 +1,514 @@
+function [info, oo_, options_, M_] = stoch_simul(M_, options_, oo_, var_list)
+%[info, oo_, options_, M_] = stoch_simul(M_, options_, oo_, var_list)
+% Computes the stochastic simulations
+%
+% INPUTS
+% - M_            [structure]       MATLAB's structure describing the model
+% - options_      [structure]       MATLAB's structure describing the current options
+% - oo_           [structure]       MATLAB's structure containing the results
+% - var_list     [character array]  list of endogenous variables specified
+%
+% OUTPUTS
+% - info          [integer]       scalar or vector, error code.
+% - oo            [structure]     MATLAB's structure containing the results
+% - options_      [structure]     MATLAB's structure describing the current options
+% - M             [structure]     MATLAB's structure describing the model
+
+% Copyright © 2001-2026 Dynare Team
+%
+% This file is part of Dynare.
+%
+% Dynare is free software: you can redistribute it and/or modify
+% it under the terms of the GNU General Public License as published by
+% the Free Software Foundation, either version 3 of the License, or
+% (at your option) any later version.
+%
+% Dynare is distributed in the hope that it will be useful,
+% but WITHOUT ANY WARRANTY; without even the implied warranty of
+% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+% GNU General Public License for more details.
+%
+% You should have received a copy of the GNU General Public License
+% along with Dynare.  If not, see <https://www.gnu.org/licenses/>.
+
+% Test if the order of approximation is nonzero (the preprocessor tests if order is non negative).
+if isequal(options_.order,0)
+    error('stoch_simul:: The order of the Taylor approximation cannot be 0!')
+end
+
+if M_.exo_nbr==0
+    error('stoch_simul:: does not support having no varexo in the model. As a workaround you could define a dummy exogenous variable.')
+end
+
+if ismember(options_.solve_algo,[10,11])
+    error('stoch_simul:: perturbation solutions are not compatible with mixed complementarity problems and their solvers')
+end
+
+idx = find(strcmp(M_.param_names, 'SL_active'), 1);
+sl_active = ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0;
+idx = find(strcmp(M_.param_names, 'AL_active'), 1);
+al_active = ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0;
+
+if sl_active && al_active
+    error('learning:bothActive', ...
+        'SL_active and AL_active are both set: only one learning mechanism can be active.');
+end
+if sl_active
+    options_ = learning.social.setup_options_SL(M_, options_);
+elseif al_active
+    options_ = learning.adaptive.setup_options_AL(M_, options_);
+end
+
+if ~sl_active && any(startsWith(M_.param_names, 'SL_'))
+    learning.social.warn_wedge_variance(M_);
+end
+
+
+test_for_deep_parameters_calibration(M_);
+
+options_old = options_;
+if options_.linear
+    options_.order = 1;
+end
+
+if options_.order == 1 && ~learning.is_active(options_)
+    options_.replic = 1;
+end
+
+if options_.order~=1 && M_.hessian_eq_zero
+    options_.order = 1;
+    warning('stoch_simul: using order = 1 because Hessian is equal to zero');
+end
+
+if isempty(options_.qz_criterium)
+    options_.qz_criterium = 1+1e-6;
+end
+
+if options_.partial_information
+    PI_PCL_solver = 1;
+    if options_.order ~= 1
+        warning('stoch_simul:: forcing order=1 since you are using partial_information')
+        options_.order = 1;
+    end
+else
+    PI_PCL_solver = 0;
+end
+
+TeX = options_.TeX;
+
+if isempty(var_list)
+    var_list = M_.endo_names(1:M_.orig_endo_nbr);
+end
+
+[i_var, nvar, index_uniques] = varlist_indices(var_list, M_.endo_names);
+var_list=var_list(index_uniques);
+oo_.var_list = var_list;
+
+iter_ = max(options_.periods,1);
+if M_.exo_nbr > 0
+    oo_.exo_simul= ones(iter_ + M_.maximum_lag + M_.maximum_lead,1) * oo_.exo_steady_state';
+end
+
+check_model(M_);
+
+oo_.dr=set_state_space(oo_.dr,M_);
+
+if PI_PCL_solver
+    [oo_.dr, info] = PCL_resol(M_, options_, oo_);
+elseif options_.discretionary_policy
+    if ~options_.order==1
+        error('discretionary_policy: only linear-quadratic problems can be solved');
+    end
+    [oo_.dr,info,M_.params] = discretionary_policy_1(M_,options_,oo_.dr, oo_.steady_state, oo_.exo_steady_state, oo_.exo_det_steady_state);
+else
+    if options_.logged_steady_state %if steady state was previously logged, undo this
+        oo_.dr.ys=exp(oo_.dr.ys);
+        oo_.steady_state=exp(oo_.steady_state);
+        options_.logged_steady_state=0;
+    end
+    [oo_.dr,info,M_.params] = resol(0,M_,options_,oo_.dr ,oo_.steady_state, oo_.exo_steady_state, oo_.exo_det_steady_state);
+end
+
+if options_.loglinear && isfield(oo_.dr,'ys') && options_.logged_steady_state==0 %log steady state for correct display of decision rule
+    oo_.dr.ys=log_variable(1:M_.endo_nbr,oo_.dr.ys,M_);
+    oo_.steady_state=log_variable(1:M_.endo_nbr,oo_.steady_state,M_);
+    options_old.logged_steady_state = 1; %make sure option is preserved outside of stoch_simul
+    options_.logged_steady_state=1; %set option for use in stoch_simul
+end
+if info(1)
+    options_ = options_old;
+    print_info(info, options_.noprint, options_);
+    return
+end
+
+if learning.is_active(options_, 'social')
+    oo_ = learning.social.compute_ghr(M_, options_, oo_);
+end
+
+if ~options_.noprint
+    if ~options_.nomodelsummary
+        skipline()
+        disp('MODEL SUMMARY')
+        skipline()
+        disp(['  Number of variables:         ' int2str(M_.endo_nbr)])
+        disp(['  Number of stochastic shocks: ' int2str(M_.exo_nbr)])
+        disp(['  Number of state variables:   ' int2str(M_.nspred)])
+        disp(['  Number of jumpers:           ' int2str(M_.nsfwrd)])
+        disp(['  Number of static variables:  ' int2str(M_.nstatic)])
+        my_title='MATRIX OF COVARIANCE OF EXOGENOUS SHOCKS';
+        labels = M_.exo_names;
+        headers = vertcat('Variables', labels);
+        dyntable(options_.noprint, my_title, headers, labels, M_.Sigma_e, [], 10, 6);
+        if options_.TeX
+            labels = M_.exo_names_tex;
+            headers = vertcat('Variables', labels);
+            dyn_latex_table(M_, options_.noprint, my_title, 'covar_ex_shocks', headers, labels, M_.Sigma_e, [], 10, 6);
+        end
+        if size(M_.Skew_e, 1) > 0
+            my_title='COSKEWNESS OF EXOGENOUS SHOCKS';
+            % Indices are stored in sorted (increasing) order, one row per unique entry
+            unique_entries = M_.Skew_e;
+            labels = cell(size(unique_entries, 1), 1);
+            values = zeros(size(unique_entries, 1), 1);
+            if options_.TeX
+                labels_tex = cell(size(unique_entries, 1), 1);
+            end
+            for j = 1:size(unique_entries, 1)
+                i1 = unique_entries(j, 1);
+                i2 = unique_entries(j, 2);
+                i3 = unique_entries(j, 3);
+                if i1 == i2 && i2 == i3
+                    labels{j} = sprintf('Skew(%s)', M_.exo_names{i1});
+                else
+                    labels{j} = sprintf('Skew(%s, %s, %s)', M_.exo_names{i1}, M_.exo_names{i2}, M_.exo_names{i3});
+                end
+                if options_.TeX
+                    if i1 == i2 && i2 == i3
+                        labels_tex{j} = sprintf('Skew(%s)', M_.exo_names_tex{i1});
+                    else
+                        labels_tex{j} = sprintf('Skew(%s, %s, %s)', M_.exo_names_tex{i1}, M_.exo_names_tex{i2}, M_.exo_names_tex{i3});
+                    end
+                end
+                values(j) = unique_entries(j, 4);
+            end
+            headers = {'Entry'; 'Value'};
+            dyntable(options_.noprint, my_title, headers, labels, values, [], 10, 4);
+            if options_.TeX
+                headers_tex = {'Entry'; 'Value'};
+                dyn_latex_table(M_, options_.noprint, my_title, 'coskew_ex_shocks', headers_tex, labels_tex, values, [], 10, 6);
+            end
+        end
+        if ~all(diag(M_.H)==0)
+            my_title='MATRIX OF COVARIANCE OF MEASUREMENT ERRORS';
+            labels = cellfun(@(x) horzcat('SE_', x), options_.varobs, 'UniformOutput', false);
+            headers = vertcat('Variables', labels);
+            dyntable(options_.noprint, my_title, headers, labels, M_.H, [], 10, 6);
+            if options_.TeX
+                labels = M_.exo_names_tex;
+                headers = vertcat('Variables', labels);
+                dyn_latex_table(M_, options_.noprint, my_title, 'covar_ME', headers, labels, M_.H, [], 10, 6);
+            end
+        end
+    end
+    if options_.partial_information
+        skipline()
+        disp('SOLUTION UNDER PARTIAL INFORMATION')
+        skipline()
+
+        if isfield(options_,'varobs')&& ~isempty(options_.varobs)
+            PCL_varobs = options_.varobs;
+            disp('OBSERVED VARIABLES')
+        else
+            PCL_varobs = M_.endo_names;
+            disp(' VAROBS LIST NOT SPECIFIED')
+            disp(' ASSUMED OBSERVED VARIABLES')
+        end
+        for i=1:length(PCL_varobs)
+            disp(['    ' PCL_varobs{i}])
+        end
+    end
+    skipline()
+    if options_.order <= 2 && ~PI_PCL_solver
+        if ~options_.nofunctions
+            disp_dr(M_,options_,oo_.dr,options_.order,var_list);
+        end
+    end
+end
+
+if options_.periods > 0 && ~PI_PCL_solver
+    if options_.periods <= options_.drop
+        fprintf('\nSTOCH_SIMUL error: The horizon of simulation is shorter than the number of observations to be dropped.\n')
+        fprintf('STOCH_SIMUL error: Either increase options_.periods or decrease options_.drop.\n')
+        options_ =options_old;
+        return
+    end
+    if isempty(oo_.histval.endo)
+        y0 = oo_.dr.ys;
+    else
+        if options_.loglinear
+            y0 = log_variable(1:M_.endo_nbr,oo_.histval.endo,M_);
+        else
+            y0 = oo_.histval.endo;
+        end
+    end
+
+    if learning.is_active(options_)
+        
+        id_struct = find(diag(M_.Sigma_e) > 0);
+        cs        = get_lower_cholesky_covariance(M_.Sigma_e, options_.add_tiny_number_to_cholesky);
+        chol_struct = cs(id_struct, id_struct)';
+
+        base_seed = options_.DynareRandomStreams.seed;
+        algo      = options_.DynareRandomStreams.algo;
+        [belief_rng, shock_rng] = learning.learning_streams(base_seed, algo, 'sim', 1);
+
+        ee = zeros(options_.periods, M_.exo_nbr);
+        ee(:, id_struct) = randn(shock_rng, options_.periods, numel(id_struct)) * chol_struct;
+
+        if learning.is_active(options_,'social')
+            oo_ = learning.social.simult_SL(M_, options_, oo_, ee, belief_rng);
+        else 
+            oo_ = learning.adaptive.simult_AL(M_, options_, oo_, ee, belief_rng);
+        end
+        
+         
+    else
+        M_.csn = csn_update_specification(M_.Sigma_e, M_.Skew_e);
+        [oo_.endo_simul, oo_.exo_simul] = simult(y0, oo_.dr, M_, options_);
+    end
+end
+if ~options_.nomoments
+    if PI_PCL_solver
+        oo_=PCL_Part_info_moments(M_, oo_, options_, PCL_varobs, oo_.dr, i_var);
+
+    elseif learning.is_active(options_, 'social')
+        if options_.periods > 0
+            oo_ = learning.social.moments_SL(M_, options_, oo_);
+        else
+            error(['stoch_simul:: Social Learning moments require a simulation ' ...
+                   'horizon. Set periods>0, or use nomoments to skip them.'])
+        end
+    elseif learning.is_active(options_, 'adaptive')
+        if options_.periods > 0
+            oo_ = learning.adaptive.moments_AL(M_, options_, oo_);
+        else
+            error(['stoch_simul:: Adaptive Learning moments require a simulation ' ...
+                'horizon. Set periods>0, or use nomoments to skip them.'])
+        end
+        
+    elseif options_.periods == 0
+        if options_.order == 1 || (options_.order == 2 && ~options_.pruning)
+            oo_=disp_th_moments(oo_.dr,var_list,M_,options_,oo_);
+        elseif (ismember(options_.order,[2,3])) && options_.pruning
+            % There is no code for theoretical moments at 3rd order without pruning
+            oo_=disp_th_moments_pruned_state_space(oo_.dr,M_,options_,i_var,oo_);
+        end
+    else
+        oo_=disp_moments(oo_.endo_simul,var_list,M_,options_,oo_);
+    end
+end
+
+
+if options_.irf
+    var_listTeX = M_.endo_names_tex(i_var);
+    if ~options_.nograph || (TeX && any(strcmp('eps',cellstr(options_.graph_format))))
+        if ~isfolder([M_.dname '/graphs'])
+            mkdir(M_.dname,'graphs');
+        end
+    end
+    if TeX && any(strcmp('eps',cellstr(options_.graph_format)))
+        fidTeX = fopen([M_.dname, '/graphs/' M_.fname '_IRF.tex'],'w');
+        fprintf(fidTeX,'%% TeX eps-loader file generated by stoch_simul.m (Dynare).\n');
+        fprintf(fidTeX,['%% ' datestr(now,0) '\n']);
+        fprintf(fidTeX,' \n');
+    end
+    cs=get_lower_cholesky_covariance(M_.Sigma_e,options_.add_tiny_number_to_cholesky);
+    tit = M_.exo_names;
+    if TeX
+        titTeX = M_.exo_names_tex;
+    end
+    if learning.is_active(options_, 'adaptive')
+        warning(' AL IRF not yet implemented, standard RE IRF will run');
+    end
+    irf_shocks_indx = getIrfShocksIndx(M_, options_);
+    for i=irf_shocks_indx
+        if cs(i,i) > 5e-7
+            if learning.is_active(options_, 'social')
+                fprintf('IRF MC simulation running on shock: %s\n\n', M_.exo_names{i})
+                [y, oo_] = learning.social.irf_SL(M_, options_, oo_, i);
+                
+            elseif PI_PCL_solver
+                y=PCL_Part_info_irf (0, PCL_varobs, i_var, M_, oo_.dr, options_.irf, i);
+            else
+                if options_.order>1 && options_.relative_irf % normalize shock to 0.01 before IRF generation for GIRFs; multiply with 100 later
+                    y=irf(M_, options_, oo_.dr,cs(:,i)./cs(i,i)/100, options_.irf, options_.drop, ...
+                          options_.replic, options_.order);
+                else %for linear model, rescaling is done later
+                    y=irf(M_, options_, oo_.dr,cs(:,i), options_.irf, options_.drop, ...
+                          options_.replic, options_.order);
+                end
+            end
+            if ~options_.noprint && any(any(isnan(y))) && ~options_.pruning && ~(options_.order==1)
+                fprintf('\nstoch_simul:: The simulations conducted for generating IRFs to %s were explosive.\n', M_.exo_names{i})
+                fprintf('stoch_simul:: No IRFs will be displayed. Either reduce the shock size, \n')
+                fprintf('stoch_simul:: use pruning, or set the approximation order to 1.');
+                skipline(2);
+            end
+            if options_.relative_irf
+                if options_.order==1 %multiply with 100 for backward compatibility
+                    y = 100*y/cs(i,i);
+                end
+            end
+            irfs   = [];
+            mylist = [];
+            if TeX
+                mylistTeX = [];
+            end
+            for j = 1:nvar
+                oo_.irfs.([M_.endo_names{i_var(j)} '_' M_.exo_names{i}]) = y(i_var(j),:);
+                if max(abs(y(i_var(j),:))) >= options_.impulse_responses.plot_threshold
+                    irfs  = cat(1,irfs,y(i_var(j),:));
+                    if isempty(mylist)
+                        mylist = var_list{j};
+                    else
+                        mylist = char(mylist, var_list{j});
+                    end
+                    if TeX
+                        if isempty(mylistTeX)
+                            mylistTeX = var_listTeX{j};
+                        else
+                            mylistTeX = char(mylistTeX, var_listTeX{j});
+                        end
+                    end
+                else
+                    if options_.debug
+                        fprintf('stoch_simul:: The IRF of %s to %s is smaller than the irf_plot_threshold of %4.3f and will not be displayed.\n',M_.endo_names{i_var(j)},M_.exo_names{i},options_.impulse_responses.plot_threshold)
+                    end
+                end
+            end
+            if ~options_.nograph
+                number_of_plots_to_draw = size(irfs,1);
+                [nbplt,nr,nc,lr,lc,nstar] = pltorg(number_of_plots_to_draw);
+                if nbplt == 0
+                elseif nbplt == 1
+                    if options_.relative_irf
+                        hh_fig = dyn_figure(options_.nodisplay,'Name',['Relative response to' ...
+                                            ' orthogonalized shock to ' tit{i}]);
+                    else
+                        hh_fig = dyn_figure(options_.nodisplay,'Name',['Orthogonalized shock to' ...
+                                            ' ' tit{i}]);
+                    end
+                    for j = 1:number_of_plots_to_draw
+                        subplot(nr,nc,j);
+                        plot(1:options_.irf,transpose(irfs(j,:)),'-k','linewidth',1);
+                        hold on
+                        plot([1 options_.irf],[0 0],'-r','linewidth',0.5);
+                        hold off
+                        xlim([1 options_.irf]);
+                        remove_fractional_xticks;
+                        if TeX
+                            title(['$' deblank(mylistTeX(j,:)) '$'],'Interpreter','latex');
+                        else
+                            title(deblank(mylist(j,:)),'Interpreter','none');
+                        end
+                    end
+                    dyn_saveas(hh_fig,[M_.dname, '/graphs/' M_.fname '_IRF_' tit{i}],options_.nodisplay,options_.graph_format);
+                    if TeX && any(strcmp('eps',cellstr(options_.graph_format)))
+                        fprintf(fidTeX,'\\begin{figure}[H]\n');
+                        fprintf(fidTeX,'\\centering \n');
+                        fprintf(fidTeX,'\\includegraphics[width=%2.2f\\textwidth]{%s_IRF_%s}\n',options_.figures.textwidth*min(j/nc,1),[M_.dname, '/graphs/' M_.fname],tit{i});
+                        fprintf(fidTeX,'\\caption{Impulse response functions (orthogonalized shock to $%s$).}\n',titTeX{i});
+                        fprintf(fidTeX,'\\label{Fig:IRF:%s}\n', tit{i});
+                        fprintf(fidTeX,'\\end{figure}\n');
+                        fprintf(fidTeX,' \n');
+                    end
+                else
+                    for fig = 1:nbplt-1
+                        if options_.relative_irf
+                            hh_fig = dyn_figure(options_.nodisplay,'Name',['Relative response to orthogonalized shock' ...
+                                                ' to ' tit{i} ' figure ' int2str(fig)]);
+                        else
+                            hh_fig = dyn_figure(options_.nodisplay,'Name',['Orthogonalized shock to ' tit{i} ...
+                                                ' figure ' int2str(fig)]);
+                        end
+                        for plt = 1:nstar
+                            subplot(nr,nc,plt);
+                            plot(1:options_.irf,transpose(irfs((fig-1)*nstar+plt,:)),'-k','linewidth',1);
+                            hold on
+                            plot([1 options_.irf],[0 0],'-r','linewidth',0.5);
+                            hold off
+                            xlim([1 options_.irf]);
+                            remove_fractional_xticks
+                            if TeX
+                                title(['$' deblank(mylistTeX((fig-1)*nstar+plt,:)) '$'],'Interpreter','latex');
+                            else
+                                title(deblank(mylist((fig-1)*nstar+plt,:)),'Interpreter','none');
+                            end
+                        end
+                        dyn_saveas(hh_fig,[M_.dname, '/graphs/'  M_.fname '_IRF_' tit{i} int2str(fig)],options_.nodisplay,options_.graph_format);
+                        if TeX && any(strcmp('eps',cellstr(options_.graph_format)))
+                            fprintf(fidTeX,'\\begin{figure}[H]\n');
+                            fprintf(fidTeX,'\\centering \n');
+                            fprintf(fidTeX,'\\includegraphics[width=%2.2f\\textwidth]{%s_IRF_%s%s}\n',options_.figures.textwidth*min(plt/nc,1),[M_.dname, '/graphs/' M_.fname],tit{i},int2str(fig));
+                            if options_.relative_irf
+                                fprintf(fidTeX,'\\caption{Relative impulse response functions (orthogonalized shock to $%s$).}', titTeX{i});
+                            else
+                                fprintf(fidTeX,'\\caption{Impulse response functions (orthogonalized shock to $%s$).}', titTeX{i});
+                            end
+                            fprintf(fidTeX,'\\label{Fig:IRF:%s:%s}\n', tit{i},int2str(fig));
+                            fprintf(fidTeX,'\\end{figure}\n');
+                            fprintf(fidTeX,' \n');
+                        end
+                    end
+                    hh_fig = dyn_figure(options_.nodisplay,'Name',['Orthogonalized shock to ' tit{i} ' figure ' int2str(nbplt) '.']);
+                    m = 0;
+                    for plt = 1:number_of_plots_to_draw-(nbplt-1)*nstar
+                        m = m+1;
+                        subplot(lr,lc,m);
+                        plot(1:options_.irf,transpose(irfs((nbplt-1)*nstar+plt,:)),'-k','linewidth',1);
+                        hold on
+                        plot([1 options_.irf],[0 0],'-r','linewidth',0.5);
+                        hold off
+                        xlim([1 options_.irf]);
+                        remove_fractional_xticks
+                            if TeX
+                                title(['$' deblank(mylistTeX((nbplt-1)*nstar+plt,:)) '$'],'Interpreter','latex');
+                            else
+                                title(deblank(mylist((nbplt-1)*nstar+plt,:)),'Interpreter','none');
+                            end
+                    end
+                    dyn_saveas(hh_fig,[M_.dname, '/graphs/' M_.fname '_IRF_' tit{i} int2str(nbplt) ],options_.nodisplay,options_.graph_format);
+                    if TeX && any(strcmp('eps',cellstr(options_.graph_format)))
+                        fprintf(fidTeX,'\\begin{figure}[H]\n');
+                        fprintf(fidTeX,'\\centering \n');
+                        fprintf(fidTeX,'\\includegraphics[width=%2.2f\\textwidth]{%s_IRF_%s%s}\n',options_.figures.textwidth*min(m/lc,1),[M_.dname, '/graphs/' M_.fname],tit{i},int2str(nbplt));
+                        if options_.relative_irf
+                            fprintf(fidTeX,'\\caption{Relative impulse response functions (orthogonalized shock to $%s$).}', titTeX{i});
+                        else
+                            fprintf(fidTeX,'\\caption{Impulse response functions (orthogonalized shock to $%s$).}', titTeX{i});
+                        end
+                        fprintf(fidTeX,'\\label{Fig:IRF:%s:%s}\n', tit{i},int2str(nbplt));
+                        fprintf(fidTeX,'\\end{figure}\n');
+                        fprintf(fidTeX,' \n');
+                    end
+                end
+            end
+        end
+    end
+    if TeX && any(strcmp('eps',cellstr(options_.graph_format)))
+        fprintf(fidTeX,' \n');
+        fprintf(fidTeX,'%% End Of TeX file. \n');
+        fclose(fidTeX);
+    end
+end
+
+if options_.SpectralDensity.trigger
+    [oo_] = UnivariateSpectralDensity(M_,oo_,options_,var_list);
+end
+
+
+options_ = options_old;
+% temporary fix waiting for local options
+options_.partial_information = 0;
+
+oo_.gui.ran_stoch_simul = true;

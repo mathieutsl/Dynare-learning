@@ -1,0 +1,1182 @@
+\documentclass[11pt,a4paper]{article}
+
+%------------------------------------------------
+% Packages
+%------------------------------------------------
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+
+\usepackage{xcolor}
+\usepackage{listings}
+
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{float}
+
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+
+\setcounter{tocdepth}{3}
+
+%------------------------------------------------
+% Listings style  (Dynare .mod highlighting)
+%------------------------------------------------
+
+\lstdefinestyle{dynare}{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red!70!black},
+    frame=single,
+    breaklines=true,
+    columns=fullflexible,
+    morekeywords={var, varexo, parameters, model, end, shocks, stderr,
+                  stoch_simul, estimation, estimated_params, steady, check,
+                  varobs, initval, histval, calib_smoother, set_dynare_seed}
+}
+
+\lstdefinestyle{matlab}{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red!70!black},
+    frame=single,
+    breaklines=true,
+    columns=fullflexible,
+    language=Matlab
+}
+
+%------------------------------------------------
+% Custom environments and commands
+%------------------------------------------------
+
+\newtcolorbox{cmdsyntax}{
+    colback=blue!3, colframe=blue!40!black,
+    fonttitle=\bfseries\ttfamily, boxrule=0.5pt,
+    left=6pt, right=6pt, top=4pt, bottom=4pt
+}
+
+\newcommand{\optentry}[4]{%
+    \paragraph{\texttt{#1}\hfill\textnormal{\textit{#2}}}%
+    #4\par\smallskip\noindent Default:~\texttt{#3}.\par\medskip
+}
+
+\newcommand{\outputvar}[2]{%
+    \paragraph{\texttt{#1}}%
+    #2\par\medskip
+}
+
+\newcommand{\command}[1]{\texttt{#1}}
+\newcommand{\option}[1]{\texttt{#1}}
+\newcommand{\field}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\matlab}{\textsc{Matlab}}
+
+%------------------------------------------------
+% Title
+%------------------------------------------------
+
+\title{\textbf{Learning Expectations in Dynare}\\[0.3em]
+       \large Social Learning and Adaptive Learning}
+\date{}
+
+%================================================
+\begin{document}
+
+\maketitle
+
+\begin{center}
+\begin{minipage}{0.85\textwidth}
+\small
+\textbf{Status.} Working document: on how to use the learning toolbox.
+Written by Mathieu Tassel during a research internship at CEPREMAP (2026), as
+part of the project adding the \file{+learning} package. 
+
+\medskip
+\textbf{References.}
+Social learning: Grimaud, Salle \& Vermandel, ``A Dynare Toolbox for Social
+Learning Expectations,'' \textit{Journal of Economic Dynamics and Control},
+2025.
+Adaptive learning: Slobodyan \& Wouters, ``Learning in a Medium-Scale DSGE Model
+with Expectations Based on Small Forecasting Models,'' \textit{American Economic
+Journal: Macroeconomics}, 4(2), 2012.
+\end{minipage}
+\end{center}
+
+\tableofcontents
+\newpage
+
+
+%================================================================
+%  SECTION 0 — OVERVIEW
+%================================================================
+\section{Overview}
+\label{sec:overview}
+
+The \file{matlab/+learning} package replaces the rational-expectations (RE)
+assumption by a mechanism in which agents form expectations from something other
+than the model solution. Two mechanisms are available:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Social learning} (\file{+learning/+social}). A population of
+      agents holds heterogeneous beliefs about the forward-looking variables.
+      Each period a fraction of them receives news, beliefs are ranked by a
+      discounted forecast-error criterion, and pairs of agents adopt the fitter
+      of the two. The aggregate belief wedge enters the policy function through
+      an additional matrix $R$. Both simulation and estimation are supported.
+\item \textbf{Adaptive learning} (\file{+learning/+adaptive}). Agents forecast
+      the forward variables with a small perceived law of motion whose
+      coefficients are updated by constant-gain recursive least squares. The
+      actual law of motion is re-solved every period from those beliefs.
+      Simulation only.
+\end{itemize}
+
+Both mechanisms are configured through naming conventions on parameters
+declared in the \file{.mod} file.\\
+
+You can find three  examples in \file{examples/learning/}: a social learning
+simulation, a social learning estimation, and an adaptive learning simulation.
+
+\medskip
+\noindent Sections
+\ref{sec:declaration}--\ref{sec:estimation} describe social learning, which is
+the more complete of the two. \Cref{sec:adaptive} describes adaptive learning.
+\Cref{sec:limitations} lists what is not supported, and
+\cref{app:architecture} documents the internal architecture.
+
+
+%================================================================
+%  SECTION 1 — MODEL DECLARATION
+%================================================================
+\section{Model declaration}
+\label{sec:declaration}
+
+Declaring a social learning model requires three things in the \file{.mod}
+file:
+
+\begin{enumerate}
+    \item \texttt{SL\_active = 1}, so that Dynare routes to the learning path.
+    \item One \texttt{SL\_learn\_<var> = 1} for each learned forward variable.
+    \item For each of them: \texttt{SL\_mutation\_std\_<var>},
+          \texttt{SL\_fitness\_discount\_<var>}, \texttt{SL\_mutation\_prob\_<var>},
+          and a news shock \texttt{a\_<var>} in \command{varexo}. None of these
+          has a default value. The global options, such as
+          \texttt{SL\_n\_agents}, do have one.
+\end{enumerate}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{\texttt{SL\_}-prefixed parameters}
+\label{sec:declaration:params}
+
+\subsubsection{Naming convention}
+
+\begin{longtable}{>{\ttfamily\small}p{5.4cm} >{\ttfamily\small}p{3.4cm} p{1.6cm} p{3.6cm}}
+\toprule
+\normalfont\textbf{Parameter in \file{.mod}}
+    & \normalfont\textbf{Field in \texttt{options\_.\allowbreak learning.social}}
+    & \normalfont\textbf{Default}
+    & \normalfont\textbf{Description} \\
+\midrule
+\endhead
+SL\_active                & ---        & 0     & Master switch. Must be set to 1 explicitly to use learning\\
+SL\_learn\_VAR            & id\_SL     & ---   & 1 marks \texttt{VAR} as learned, 0 keeps it at RE. A forward variable with no flag is not learned \\
+SL\_n\_agents             & N\_agents  & 300   & Population size $J$\\
+SL\_wedding\_proportion   & wed\_p     & 1.0   & Share of the population entering the tournament \\
+SL\_t\_max                & t\_max     & 1     & Horizon of the reported $h$-step-ahead expectations \\
+\midrule
+SL\_mutation\_prob\_VAR       & mut\_p     & ---  & News probability $\mu$ for \texttt{VAR}, must be in $(0,1]$ \\
+SL\_mutation\_std\_VAR    & mut\_sd(iv)   & ---  & Belief dispersion $\xi_v$ for \texttt{VAR}, must be positive \\
+SL\_fitness\_discount\_VAR & rhoGN(iv)    & ---  & Fitness memory $\delta_v$, must be in $(0,1)$ \\
+
+\bottomrule
+\end{longtable}
+
+\medskip
+\noindent
+The triplet (\texttt{mutation\_prob}, \texttt{mutation\_std},
+\texttt{fitness\_discount}) is attached to a forward-looking endogenous variable
+by the suffix \texttt{<VAR>}. Declaring a variable as learned without providing
+these three values raises an error, and so does a value outside its admissible
+range.\\
+On the other hand a per-variable parameter attached to a variable that is not
+learned has no effect: it raises \texttt{learning:social:orphanParam} as a
+warning, which in estimation avoids a flat direction in the likelihood.
+
+\medskip
+\noindent
+The scan stores the parameters and options in two places:
+
+\begin{itemize}[leftmargin=2em]
+\item \field{M\_.params} 
+\item \field{options\_.learning.social}
+\end{itemize}
+
+The SL hyperparameters can be estimated by Bayesian MCMC like any other
+parameter. They are declared in \command{estimated\_params} with a prior, and at
+each likelihood evaluation \texttt{refresh\_learning\_params} re-reads
+\field{M\_.params} into \field{options\_.learning.social}
+(\cref{sec:estimation:likelihood}).
+
+\subsubsection{The \texttt{SL\_active} switch}
+
+\texttt{SL\_active} is the only way to activate social learning. If it is not
+declared, or set to 0, Dynare runs on the RE path. The dispatch points in
+\file{stoch\_simul.m} and \file{dynare\_estimation\_1.m} read
+\texttt{SL\_active} from \field{M\_.params} before calling into the package, so
+\texttt{setup\_options\_SL} is never reached with the mechanism off.
+
+\medskip
+\noindent
+When the mechanism is off, the dispatch calls
+\texttt{learning.social.warn\_wedge\_variance}, which reports any
+\texttt{a\_VAR} shock still carrying a non-zero variance. Such a run is ``RE
+plus an expectation shock'' rather than pure RE.
+
+\subsubsection{Example}
+
+\begin{lstlisting}[style=dynare, caption={SL parameters in the \texttt{.mod} file}]
+parameters  beta kappa sigma phi_pi phi_y rho_mp        // structural
+            SL_active SL_n_agents                       // SL global
+            SL_learn_pi                                 // SL selection
+            SL_mutation_std_pi SL_fitness_discount_pi SL_mutation_prob_pi ;  // SL per-variable
+
+beta   = 0.99;  kappa = 0.03;  sigma  = 1;
+phi_pi = 1.50;  phi_y = 0.125; rho_mp = 0;
+
+SL_active              = 1;      // required: nothing runs without it
+SL_n_agents            = 300;
+SL_learn_pi            = 1;      // required: selects the learned set
+SL_mutation_prob_pi    = 0.3;
+SL_mutation_std_pi     = 0.003;
+SL_fitness_discount_pi = 0.5;
+\end{lstlisting}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Belief shocks}
+\label{sec:declaration:beliefs}
+ 
+A learned variable enters the model through an expectation equation of the
+form 
+ 
+\begin{lstlisting}[style=dynare]
+pie = pi(+1) + a_pi;
+\end{lstlisting}
+ 
+\noindent
+where \texttt{pie} is the subjective expectation of next-period inflation, the
+\texttt{(+1)} term is the model-consistent component, and \texttt{a\_pi} carries
+the deviation between the two. \texttt{a\_pi} is determined by the learning
+process.
+
+\noindent
+With \texttt{var a\_pi = 0}, \texttt{a\_pi} carries only the belief wedge: an
+object produced by the learning mechanism, never drawn. It is declared as a
+\command{varexo} because that is where the implementation stores it.
+
+\noindent
+Giving it a positive variance adds an exogenous news shock on top. Unlike an
+ordinary expectation shock, it does not just move expectations for one period,
+it enters the beliefs of the agents who receive it, and part of it survives
+into later periods through the agents the tournament keeps.
+ 
+\subsubsection{The variance of the news shock}
+\label{sec:declaration:newsvariance}
+
+In simulation, the variance is a modelling choice. A zero variance and a
+strictly positive one describe two different models:
+
+\begin{itemize}[leftmargin=2em]
+\item \emph{Pure social learning}: leave \texttt{a\_VARNAME} out of the
+      \command{shocks} block, or set its variance to zero. Beliefs then
+      deviate from rational expectations only through what the mechanism
+      generates on its own. 
+\item \emph{Learning with sentiment}: give it a positive variance. Beliefs
+      then have an exogenous driver alongside the endogenous one.
+\end{itemize}
+
+In estimation, the variance must be strictly positive, the lower
+bound of its prior must also be strictly positive . The likelihood evaluates the Gaussian density of the shocks recovered by inversion; a zero-variance shock makes that density degenerate, and
+the mode-finder drives $\sigma_{a_v}$ onto its lower bound.
+
+
+\subsubsection{The selection matrices \texttt{Or} and \texttt{Ox}}
+
+The scan produces two matrices in \field{options\_.learning.social}:
+
+\begin{itemize}[leftmargin=2em]
+\item \field{Or} ($n_{\text{fwrd}} \times n_{\text{exo}}$): entry $(i,j) = 1$
+      if the $i$-th forward variable is learned and the $j$-th exogenous is its
+      belief channel. 
+\item \field{Ox} ($n_{\text{exo}} \times n_{\text{exo}}$): the complementary
+      projector $I - O_r'O_r$, which selects the structural shocks. 
+\end{itemize}
+
+%================================================================
+%  SECTION 2 — STOCHASTIC SIMULATION
+%================================================================
+\section{Stochastic simulation under Social Learning}
+\label{sec:simulation}
+
+When \field{options\_.learning.social} is populated, \command{stoch\_simul}
+activates the SL pipeline. The RE decision rules are solved first, then the learning matrix $R$
+is computed, then the simulation runs forward with social learning. 
+
+\begin{enumerate}[leftmargin=2em]
+\item \texttt{learning.social.setup\_options\_SL} scans the parameters, builds
+      \field{options\_.learning.social} and rejects unsupported configurations
+      (\cref{sec:simulation:setup_options}).
+\item \texttt{learning.social.compute\_ghr} computes $R$ from the dynamic
+      Jacobian (\cref{sec:simulation:compute_ghr}).
+\item \texttt{learning.social.simult\_SL} runs the forward simulation with
+      mutation and tournament (\cref{sec:simulation:simult_SL}).
+\item \texttt{learning.social.moments\_SL} and \texttt{learning.social.irf\_SL}
+      produce the Monte Carlo moments and the generalised IRFs
+      (\cref{sec:simulation:moments,sec:simulation:irfs}).
+\end{enumerate}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Standard Dynare options}
+\label{sec:simulation:std_options}
+
+The SL path reuses the native \command{stoch\_simul} options.
+
+\optentry{order}{INTEGER}{1}{%
+    Order of the Taylor approximation. Social learning requires
+    \option{order=1}; a higher order raises
+    \texttt{learning:social:order}.}
+
+\optentry{periods}{INTEGER}{0}{%
+    Length of each simulated path. Required: SL moments are always simulated,
+    never analytical. }
+
+\optentry{drop}{INTEGER}{100}{%
+    Burn-in discarded before moments are measured, and common burn-in before
+    the impulse in the generalised IRFs.}
+
+\optentry{replic}{INTEGER}{1}{%
+    Number of Monte Carlo replications over agent draws, for both moments and
+    IRFs. This is what the empirical confidence bands are computed from.}
+
+\optentry{irf}{INTEGER}{40}{%
+    Horizon of the generalised IRFs.}
+
+\optentry{ar}{INTEGER}{5}{%
+    Number of autocorrelation lags reported.}
+
+\optentry{noprint}{BOOLEAN}{false}{%
+    Suppress the summary tables.}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Option scanning and rejected configurations}
+\label{sec:simulation:setup_options}
+
+\texttt{setup\_options\_SL} is called from the dispatch point at the very
+beginning of \command{stoch\_simul}, and only when \texttt{SL\_active} is
+non-zero.
+
+Beyond building the option structure, it builds the set of learned variables
+from the \texttt{SL\_learn\_VAR} flags and collects their parameters. Every
+learned variable must have its $\xi_v$, its $\delta_v$, its $\mu_v$ and its
+\texttt{a\_VARNAME} news shock. A missing value, or a value outside its
+admissible range, raises an error.
+
+It also calls \texttt{learning.social.check\_support}, which rejects the
+configurations listed in \cref{sec:limitations}.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Random number streams}
+\label{sec:simulation:rng}
+
+Social learning uses random streams for two purposes: the belief path (which
+agents mutate, how they are paired) and the structural shocks. The two are
+drawn from separate, non-overlapping substreams of a single seed, built by
+\texttt{learning.learning\_streams}:
+
+\begin{itemize}[leftmargin=2em]
+\item \texttt{'sim'} mode, replication $k$: beliefs on substream $2k-1$, shocks
+      on substream $2k$. 
+\item \texttt{'estim'} mode: beliefs on a fixed substream, so that the belief
+      realisation is frozen across parameter draws.
+\end{itemize}
+
+Substreams require \texttt{mrg32k3a} or \texttt{mlfg6331\_64}. If you don't declare one, \texttt{setup\_options\_SL} sets \texttt{mrg32k3a} and prints a
+warning.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Computing the $R$ matrix (\texttt{compute\_ghr})}
+\label{sec:simulation:compute_ghr}
+
+Under social learning the policy function is
+
+\begin{equation}
+\label{eq:policy}
+y_t = \bar{y} + P\,(y_{t-1} - \bar{y})
+      + Q\,O_x\,\varepsilon_t
+      + R_f\,\bigl(\varphi_t + O_r\,\varepsilon_t\bigr),
+\end{equation}
+
+where $P$ and $Q$ are the RE decision-rule matrices (\field{ghx},
+\field{ghu} re-indexed in declaration order), $R_f$ collects the
+forward-variable columns of $R$, and $\varphi_t$ is the aggregate belief wedge.
+The $O_x$/$O_r$ split is what separates the structural shocks from the belief
+channel.
+\noindent
+Solving the model gives
+
+\begin{equation}
+R = -\bigl(I + A^{-1}F\bigr)^{-1} A^{-1} F,
+\qquad A \equiv F P + G .
+\end{equation}
+
+$R$ is $n_{\text{endo}} \times n_{\text{endo}}$ but only the forward-variable
+columns are non-zero. It is computed once after \texttt{resol} and stored in
+\field{oo\_.dr.ghr}, leaving \field{ghx}, \field{ghu} and \field{ys}
+untouched.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Forward simulation (\texttt{simult\_SL})}
+\label{sec:simulation:simult_SL}
+
+\paragraph{Algorithm.} At each period $t$, in this order:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Mutation.} For each forward variable $v$, draw
+      $\mathrm{round}(\mu_v J)$ agents uniformly, with one independent
+      \texttt{randperm} per variable, and perturb their belief by
+      $\mathcal{N}(0, \xi_v^2)$. This gives the candidate beliefs $m_{j,t}$.
+\item \textbf{Aggregation and transition.} The candidate aggregate
+      $\varphi_t = \frac{1}{J}\sum_j m_{j,t}$ enters the policy function
+      \eqref{eq:policy}, producing $y_t$.
+\item \textbf{News injection.} The realisation of the belief shock is added to
+      the mutants' beliefs, rescaled by $1/\mu_v$
+      (\cref{sec:simulation:conventions}).
+\item \textbf{Fitness.} Each agent's belief is scored by a discounted sum of
+      squared forecast errors, the forecast being the one implied by the agent's
+      own belief and the policy function.
+\item \textbf{Tournament.} Agents are paired at random; both members of a pair
+      adopt the belief of the fitter one. This gives the post-tournament
+      beliefs $a_{j,t}$, which are the starting point of period $t+1$.
+\end{enumerate}
+
+Aggregation precedes the fitness evaluation: beliefs influence $y_t$, and are
+then scored against that same $y_t$.
+
+\paragraph{Outputs.}
+\begin{itemize}[leftmargin=2em]
+\item \field{oo\_.endo\_simul}: simulated path,
+      $n_{\text{endo}} \times T$ (no initial-condition column).
+\item \field{oo\_.learning.social.beliefs}: post-tournament beliefs
+      $a_{j,t}$, $n_{\text{fwrd}} \times J \times T$.
+\item \field{oo\_.learning.social.beliefs\_candidate}: post-injection
+      candidates $m_{j,t}$, same size.
+\item \field{oo\_.learning.social.fitness}: fitness values, same size.
+\item \field{oo\_.learning.social.expectations}: aggregate wedge entering
+      the policy function, $\varphi_t + O_r\varepsilon_t$,
+      $n_{\text{fwrd}} \times T$.
+\item \field{oo\_.learning.social.expectations\_ahead}: $h$-step-ahead
+      aggregate expectations, $n_{\text{fwrd}} \times T \times \mathtt{t\_max}$.
+      Diagnostic only.
+\item \field{oo\_.learning.social.final\_beliefs}: beliefs at $t = T$,
+      $n_{\text{fwrd}} \times J$.
+\item \field{oo\_.learning.social.y\_RE}: the RE trajectory under the same
+      structural shocks, for comparison.
+\end{itemize}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Moments}
+\label{sec:simulation:moments}
+
+\texttt{learning.social.moments\_SL} runs \option{replic} independent
+simulations and averages the
+resulting moments. Every replication starts agents at zero beliefs and
+discards \option{drop} burn-in periods.
+
+\paragraph{Outputs.}
+\begin{itemize}[leftmargin=2em]
+\item \field{oo\_.mean}, \field{oo\_.var},
+      \field{oo\_.autocorr\{1:ar\}}: Monte Carlo averages, in the standard
+      Dynare format but always simulated.
+\item \field{oo\_.learning.social.moments.mean\_ci}, \field{.std\_ci},
+      \field{.autocorr\_ci\{1:ar\}}: empirical $2.5/97.5$ percentile
+      intervals across replications.
+\item \field{oo\_.learning.social.moments.cross\_section}: cross-sectional
+      belief statistics: \field{std\_mean}, \field{iqr\_mean},
+      \field{skew\_mean} averaged over time and replications, plus the
+      time-series versions \field{*\_ts}.
+\item \field{oo\_.learning.social.moments.mc\_raw}: the raw replication-level
+      data.
+\end{itemize}
+
+\paragraph{Display.} \texttt{disp\_moments\_SL} prints three tables: aggregate
+moments with their intervals against the RE theoretical standard deviations,
+first-order autocorrelations against their RE counterparts, and the
+cross-sectional belief moments. The RE column comes from the native
+\texttt{th\_autocovariances}.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Impulse response functions}
+\label{sec:simulation:irfs}
+
+\texttt{learning.social.irf\_SL} computes generalised IRFs by paired Monte
+Carlo. For each replication, two simulations are run from the same belief
+substream, one baseline and one with an impulse at the first post-burn-in
+period, the stream state being saved and restored between them. The GIRF is the
+difference, and the reported response is the median across replications.
+
+The impulse is the corresponding column of the lower Cholesky factor,
+$cs(:,j)$, exactly as in the native \texttt{irf} path, so the responses are
+orthogonalised and comparable with the RE benchmark.
+
+\paragraph{Outputs.} For each shock,
+\field{oo\_.learning.social.irf.\textit{shock}} holds \field{median},
+\field{mean} and \field{bands}. The median GIRF is also written to the
+\field{oo\_.irfs} structure, so Dynare's plotting routines work unchanged.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Historical decomposition}
+\label{sec:simulation:decomp}
+
+With \field{options\_.learning.social.decomp} set, \texttt{simult\_SL} also
+propagates one trajectory per channel: one per structural shock and one per
+forward variable for the belief channels. The contributions sum to
+$y_t - \bar{y}$ by construction.
+
+\texttt{learning.social.plot\_decomp} draws the stacked contributions with the
+total trajectory overlaid.
+
+\medskip
+\noindent
+The adding-up is exact only when $\mathrm{round}(\mu_v J) = \mu_v J$, for the
+reason given in \cref{sec:simulation:conventions}; the residual is reported.
+
+
+%================================================================
+%  SECTION 3 — ESTIMATION
+%================================================================
+\section{Estimation under Social Learning}
+\label{sec:estimation}
+
+The SL likelihood plugs into Dynare's native Bayesian estimation
+infrastructure. All standard \command{estimation} options, the mode-finders,
+the MCMC and the posterior diagnostics are available.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Setting up estimation}
+\label{sec:estimation:setup}
+
+Data are declared exactly as in a standard estimation. The binding constraint
+is the inversion identification condition: \textbf{the number of observables
+must equal the number of exogenous shocks}, belief shocks included. This is the
+same requirement as Dynare's \option{conditional\_likelihood}, and it also
+implies no measurement error and no missing observations.
+
+\subsubsection{Priors}
+
+\begin{lstlisting}[style=dynare, caption={Priors for SL parameters}]
+estimated_params;
+  // structural
+  rho_d,                  , 0, 0.999, beta_pdf,       0.5,  0.2;
+  kappa,                  , 0, 0.999, gamma_pdf,      0.3,  0.05;
+  phi_pi,                 , 1, 10.00, gamma_pdf,      1.5,  0.1;
+  // shock standard deviations, including the belief channel
+  stderr e_d,             , 0, 1,     inv_gamma2_pdf, 0.001, 1;
+  stderr e_s,             , 0, 1,     inv_gamma2_pdf, 0.001, 1;
+  stderr a_pi,            , 0, 1,     inv_gamma2_pdf, 0.001, 1;
+  // SL hyperparameters. 
+  SL_fitness_discount_pi, , 0, 0.999, beta_pdf,       0.8,  0.1;
+end;
+\end{lstlisting}
+
+\noindent
+Only parameters attached to a learned variable can be estimated. Bound for $\mu$ and
+$\delta$ must be away from the edges of $(0,1)$: a draw outside the admissible range is
+rejected with an infinite objective rather than crashing, but a prior that puts
+mass there wastes evaluations.
+
+\medskip
+\noindent
+Some SL parameters are harder to identify because the likelihood is not
+continuous in them. This is the case for $\xi$: with a finite population, small
+changes in $\xi$ flip the outcome of the tournament, so the log-posterior jumps.
+A mode-finder then returns the highest point of that noise rather than a
+maximum, and the Hessian at the mode is not usable. One solution is to calibrate
+$\xi$ and estimate $\delta$.
+
+
+\subsubsection{\texttt{setup\_learning\_estimation}}
+
+Before the likelihood loop, \texttt{setup\_learning\_estimation} runs once. It
+is the SL counterpart of \texttt{dynare\_estimation\_init} and builds the
+observation selection matrix $O$, the forward-variable indices, and the index
+maps linking positions in \field{M\_.params} to the \field{mut\_sd},
+\field{rhoGN} and \field{mut\_p} vectors. These maps let
+\texttt{refresh\_learning\_params} inject the current draw at each evaluation
+without re-scanning \field{M\_.param\_names}.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{The inversion filter (\texttt{IF\_SL})}
+\label{sec:estimation:filter}
+
+Given a parameter vector $\theta$ and the solved model:
+
+\begin{enumerate}[leftmargin=2em]
+\item Initialise $J$ agents at zero beliefs and the state at its steady state.
+\item For each period $t$:
+      \begin{enumerate}
+      \item run the mutation step to obtain the candidate beliefs and the
+            aggregate $\varphi_t$;
+      \item invert the observation equation to extract the shocks,
+            $\hat{\varepsilon}_t = \lambda^{-1}\bigl(y_t^{\text{obs}} - c
+            - O(P\hat{y}_{t-1} + R_f\varphi_t)\bigr)$;
+      \item feed $\hat{\varepsilon}_t$ into the transition and into the belief
+            recursion, then run the fitness and tournament steps.
+      \end{enumerate}
+\item Accumulate the per-period log-likelihood contributions.
+\end{enumerate}
+
+The inversion Jacobian is
+$\lambda = O\,Q\,O_x + O\,R_f\,O_r$, constant across periods. It is checked to
+be well conditioned: an ill-conditioned $\lambda$ means the observables carry
+almost no independent information about the shocks.
+
+\paragraph{Measurement constant.} The data are compared to
+$c + O(y_t - \bar{y})$ with $c = O\bar{y}$, or $c = 0$ when
+\option{prefilter} is set and the data have been demeaned. The constant that
+was removed is reported in \field{oo\_.Smoother.Constant}, following the native
+convention.
+
+\paragraph{Random numbers.} \texttt{IF\_SL} does not build its own stream: the
+belief stream is passed as the fifth argument. The caller
+(\texttt{dsge\_likelihood\_SL}) builds it in \texttt{'estim'} mode at every
+evaluation, which freezes the belief realisation across parameter draws.
+
+\paragraph{Early stopping.} If the cumulated inversion residual exceeds a
+threshold, the loop stops and reports how many periods were left unprocessed.
+The likelihood is then penalised, and the smoother marks the unreached periods
+as \texttt{NaN} rather than leaving them at their initial value.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Log-likelihood (\texttt{dsge\_likelihood\_SL})}
+\label{sec:estimation:likelihood}
+
+\texttt{learning.social.dsge\_likelihood\_SL} has the same argument and output
+signature as the native \texttt{dsge\_likelihood}.
+
+\paragraph{Formula.} With $n_e$ shocks of positive variance and $T$
+observations after the presample,
+
+\begin{equation}
+\log \mathcal{L}(\theta) =
+  -\frac{n_e T}{2}\log(2\pi)
+  - \frac{T}{2}\log\bigl|\Sigma_\varepsilon\bigr|
+  - \frac{1}{2}\sum_{t}\hat{\varepsilon}_t'\Sigma_\varepsilon^{-1}\hat{\varepsilon}_t
+  - T \log\bigl|\det \lambda\bigr| .
+\end{equation}
+
+The last term is the Jacobian of the change of variables from observables to
+shocks.
+
+\paragraph{Parameter refresh.} At each evaluation,
+\texttt{refresh\_learning\_params} copies the current \field{M\_.params} into
+the SL option fields using the precomputed index maps. The refreshed values are then range-checked, and
+a draw outside the admissible set returns an infinite objective rather than
+propagating into the belief loop.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Smoother output}
+\label{sec:estimation:smoother}
+
+\paragraph{\texttt{store\_SL\_smoother}} routes the inversion filter output
+into \field{oo\_}:
+
+\begin{itemize}[leftmargin=2em]
+\item \field{oo\_.SmoothedShocks.\textit{exo}}: smoothed shocks, belief
+      channels included.
+\item \field{oo\_.SmoothedVariables.\textit{endo}}: smoothed state
+      trajectory.
+\item \field{oo\_.Smoother.SteadyState} and \field{oo\_.Smoother.Constant}, for
+      reporting compatibility.
+\item \field{oo\_.learning.social.smoother}: the SL-specific payload,
+      \field{expectations}, the aggregate belief
+      wedge, \field{forward\_states}, \field{forward\_vars}, and the per-shock news series.
+\end{itemize}
+
+Periods the inversion did not reach are \texttt{NaN} in every output.
+
+\paragraph{\texttt{plot\_SL\_smoother\_results}} produces four figures:
+smoothed structural shocks; smoothed observables overlaid on the data;
+the aggregate news channel; and the aggregate belief wedge on the learned
+variables, which is the deviation of subjective expectations from their
+rational counterpart.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Conventions that are not in the papers}
+\label{sec:simulation:conventions}
+
+A few implementation choices cannot be derived from the published description
+and matter when reading the code.
+
+\paragraph{News rescaling by $1/\mu$.} The aggregate news $O_r\varepsilon_t$ is
+injected only into the beliefs of the mutating agents, divided by $\mu_v$, so
+that the population average moves by exactly $O_r\varepsilon_t$. 
+
+
+\paragraph{Truncation of the fitness memory.}
+The fitness criterion is a discounted sum of past forecast errors with weights
+$\delta_v^k$. The implementation truncates it where the weight falls below
+$0.01$, with a maximum of 500 lags.
+
+\begin{lstlisting}[style=matlab]
+rho_mat = rhoGN .^ (1:500);
+rho_mat = fliplr(rho_mat(:, 1:max(sum(rho_mat > 0.01, 2))))';
+T0      = size(rho_mat, 1);
+\end{lstlisting}
+
+$T_0$ is also the burn-in of the belief recursion: the loop starts at
+$T_0 + \texttt{maximum\_lag} + 1$.
+
+
+%================================================================
+%  SECTION 4 — ADAPTIVE LEARNING
+%================================================================
+\section{Adaptive learning}
+\label{sec:adaptive}
+
+The \file{+learning/+adaptive} package implements constant-gain adaptive
+learning. It is a simulation proof of concept, meant to show that a new
+learning mechanism can be added with only a few functions and hooks in Dynare.
+There is no likelihood and no estimation path for now.
+
+\paragraph{Relation to the reference.}
+The algebra and the \matlab{} implementation of this package were inspired by
+the article and the replication code of Slobodyan and Wouters (2012). In their
+framework beliefs are updated with a Kalman filter, and the constant-gain
+specification appears only in their sensitivity analysis. It is that
+constant-gain variant which is implemented here. Their projection facility,
+which prevents belief updates from destabilising the actual law of motion, is
+also reflected in \texttt{simult\_AL}: when the re-solved transition matrix has
+a spectral radius above the threshold, the whole update is rejected and the
+beliefs, the moment matrix and the transition matrices are kept at their last
+stable values. No block of code was copied from the original replication files;
+the implementation was written independently from the methodology and the
+algebra described in the reference.
+
+\paragraph{Mechanism.} Agents forecast the forward variables with a small
+perceived law of motion (PLM), either an intercept only or an intercept plus an
+AR(1) slope, estimated variable by variable. Every period the coefficients are
+updated by constant-gain recursive least squares, and the actual law of motion
+is re-solved from the updated beliefs, so the transition matrices
+$(\mu_t, T_t, R_t)$ move over time.
+
+
+\paragraph{Declaration.} No belief shock is needed: beliefs enter by re-solving
+the model, not through an exogenous channel. Only \command{parameters} are
+declared.
+
+\begin{longtable}{>{\ttfamily\small}p{4.6cm} >{\ttfamily\small}p{3.2cm} p{1.6cm} p{4.6cm}}
+\toprule
+\normalfont\textbf{Parameter} & \normalfont\textbf{Field} &
+\normalfont\textbf{Default} & \normalfont\textbf{Description} \\
+\midrule
+\endhead
+AL\_active        & ---           & 0    & Master switch \\
+AL\_gain          & gain          & 0.02 & Constant gain of the RLS updating \\
+AL\_pj\_threshold & pj\_threshold & 1.0  & Projection facility threshold on $\max|\mathrm{eig}(T)|$ \\
+AL\_plm\_type     & plm\_type     & 1    & 1 = intercept + AR(1), 0 = intercept only \\
+AL\_learn\_VAR    & id\_fwrd      & ---  & 1 marks \texttt{VAR} as learned, 0 keeps it at RE. A forward variable with no flag is not learned; declaring none while \texttt{AL\_active} $=1$ is an error \\
+\bottomrule
+\end{longtable}
+
+\noindent
+The selection rule is identical to the social-learning one: \texttt{AL\_active
+= 1} and at least one \texttt{AL\_learn\_<var> = 1} must be declared, otherwise
+the run stays on the RE path.
+
+
+\paragraph{Projection facility.} Under adaptive learning the transition matrix
+$T_t$ is re-solved every period from the current beliefs, so nothing guarantees
+it stays stable. If agents come to perceive a very high persistence, the
+resulting law of motion can have an eigenvalue above one, and the simulated
+path diverges.
+
+The projection facility prevents that. At each period it compares
+$\max|\mathrm{eig}(T_t)|$ to \texttt{AL\_pj\_threshold}; if the threshold is
+exceeded, the new law of motion is discarded and the previous, accepted one is
+reused for that period. The beliefs themselves are not modified, they keep
+updating freely: only the solution is rejected.
+
+Its purpose is practical, since without it a single unlucky draw can make the
+model diverge. Setting the threshold very high, or to \texttt{Inf}, disables the
+facility.
+
+\paragraph{Outputs.} \field{oo\_.endo\_simul} plus
+\field{oo\_.learning.adaptive.info} with \field{beta\_hist}
+($n_{\text{fwrd}} \times n_b \times T$, the belief path), \field{beta\_final}
+and \field{pf\_hits} (the number of rejected updates). Monte Carlo moments are
+produced by \texttt{moments\_AL} in the same format as the SL ones, with the
+belief-coefficient dynamics replacing the cross-sectional statistics.
+
+\paragraph{Not implemented.} Impulse responses: \command{stoch\_simul} warns and
+falls back to the RE responses, which ignore the learning dynamics. Estimation,
+richer PLMs (full state, AR(2)) and Kalman filter learning are not implemented
+either.
+
+
+%================================================================
+%  SECTION 5 — LIMITATIONS
+%================================================================
+\section{Limitations and rejected configurations}
+\label{sec:limitations}
+
+\texttt{check\_support} is called on both the simulation and the estimation
+path and raises an error for the configurations below, rather than letting them
+run to completion and return wrong results.
+
+\begin{longtable}{p{5cm} p{9.5cm}}
+\toprule
+\textbf{Configuration} & \textbf{Reason} \\
+\midrule
+\endhead
+\option{order} $> 1$ & The expectations matrix is derived from the first-order
+solution. \\
+\option{loglinear} & The Jacobian is evaluated at \field{oo\_.dr.ys}, which
+\option{loglinear} replaces by its logarithm. \\
+Deterministic exogenous variables & The Jacobian slicing does not cover them. \\
+Measurement errors (estimated or calibrated) & The inversion filter requires as
+many shocks as observables, with no measurement noise. \\
+Estimated shock correlations & The $O_x$/$O_r$ split assumes news and
+structural shocks are orthogonal. \\
+Skewed shocks & The likelihood assumes Gaussian innovations. \\
+Deterministic trends in the measurement equation & Not handled by the
+inversion. \\
+Diffuse and heteroskedastic filters & Not applicable; $\Sigma_\varepsilon$ is
+assumed constant. \\
+\option{forecast} & The smoother does not populate the \field{oo\_.Smoother}
+fields \texttt{forecasts.run} requires. \\
+\command{histval} & The simulation always starts from the steady state. \\
+\bottomrule
+\end{longtable}
+
+\noindent
+A second group produces a warning rather than an error, because the run is
+valid but an output is silently missing or not comparable:
+\option{filtered\_vars}, \option{filter\_covariance},
+\option{filter\_decomposition}, \option{moments\_varendo} and
+\option{bayesian\_irf} rely on Kalman-filter objects the inversion does not
+produce; \option{hp\_filter} and \option{bandpass} are honoured by the RE
+column of the moment tables but not by the simulated SL column.
+
+\paragraph{\option{prefilter}} is supported: the measurement constant is
+dropped when the data have been demeaned.
+
+\paragraph{Octave.} The learning streams require \matlab{}
+\texttt{RandStream} substreams, which have no Octave equivalent, and both
+\texttt{simult\_SL} and \texttt{IF\_SL} reject a non-\texttt{RandStream}
+argument. The package therefore does not run under Octave at all.
+
+
+%================================================================
+%  SECTION 6 — STORED RESULTS
+%================================================================
+\section{Stored results reference}
+\label{sec:output}
+
+\subsection{\texttt{oo\_} fields}
+
+\begin{longtable}{>{\ttfamily\small}p{6.2cm} p{8cm}}
+\toprule
+\normalfont\textbf{Field} & \textbf{Description} \\
+\midrule
+\endhead
+oo\_.dr.ghr & $R$ matrix, $n_{\text{endo}} \times n_{\text{endo}}$ \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{Simulation}} \\
+\midrule
+oo\_.endo\_simul & Simulated path, $n_{\text{endo}} \times T$ \\
+oo\_.learning.social.beliefs & Post-tournament beliefs, $n_{\text{fwrd}} \times J \times T$ \\
+oo\_.learning.social.beliefs\_candidate & Post-injection candidates, same size \\
+oo\_.learning.social.fitness & Fitness values, same size \\
+oo\_.learning.social.expectations & Aggregate wedge $\varphi_t + O_r\varepsilon_t$, $n_{\text{fwrd}} \times T$ \\
+oo\_.learning.social.expectations\_ahead & $h$-step-ahead expectations, $n_{\text{fwrd}} \times T \times$ \texttt{t\_max} \\
+oo\_.learning.social.final\_beliefs & Beliefs at $t = T$, $n_{\text{fwrd}} \times J$ \\
+oo\_.learning.social.y\_RE & RE path under the same structural shocks \\
+oo\_.learning.social.decomp & Historical decomposition, $n_{\text{endo}} \times T \times n_{\text{chan}}$ \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{Moments and IRFs}} \\
+\midrule
+oo\_.mean, oo\_.var, oo\_.autocorr & Monte Carlo moments \\
+oo\_.learning.social.moments.mean\_ci & Empirical intervals on the means \\
+oo\_.learning.social.moments.std\_ci & Empirical intervals on the standard deviations \\
+oo\_.learning.social.moments.cross\_section & Cross-sectional belief statistics \\
+oo\_.learning.social.moments.mc\_raw & Replication-level raw data \\
+oo\_.learning.social.irf.\textit{shock} & \texttt{.median}, \texttt{.mean}, \texttt{.bands} \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{Estimation}} \\
+\midrule
+oo\_.SmoothedShocks & Smoothed shocks, belief channels included \\
+oo\_.SmoothedVariables & Smoothed states \\
+oo\_.Smoother.Constant & Constant removed from the measurement equation \\
+oo\_.learning.social.smoother & \texttt{.expectations}, \texttt{.forward\_states}, \texttt{.forward\_vars}, \texttt{.news} \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{Adaptive learning}} \\
+\midrule
+oo\_.learning.adaptive.info & \texttt{.beta\_hist}, \texttt{.beta\_final}, \texttt{.pf\_hits} \\
+oo\_.learning.adaptive.moments & Same structure as the SL moments \\
+\bottomrule
+\end{longtable}
+
+
+\subsection{\texttt{options\_.learning.social} fields}
+
+\begin{longtable}{>{\ttfamily\small}p{4.4cm} >{\ttfamily\small}p{3cm} p{6.6cm}}
+\toprule
+\normalfont\textbf{Field} & \normalfont\textbf{Type} & \textbf{Description} \\
+\midrule
+\endhead
+N\_agents  & integer                  & Population size $J$ \\
+mut\_p     & double [nfwrd$\times$1]  & News probability $\mu$ \\
+wed\_p     & double                   & Tournament participation share \\
+mut\_sd    & double [nfwrd$\times$1]  & Belief dispersion $\xi$ \\
+rhoGN      & double [nfwrd$\times$1]  & Fitness memory $\delta$ \\
+t\_max     & integer                  & Horizon of the reported expectations \\
+Or         & double [nfwrd$\times$nexo] & Belief channel selection \\
+Ox         & double [nexo$\times$nexo]  & Structural shock projector $I - O_r'O_r$ \\
+id\_SL     & integer vector           & Indices of the learned variables \\
+n\_SL      & integer                  & Number of learned variables \\
+decomp     & logical                  & Compute the historical decomposition \\
+irf\_quantiles & double vector        & GIRF band levels \\
+\midrule
+\multicolumn{3}{l}{\normalfont\textit{Added by \texttt{setup\_learning\_estimation}}} \\
+\midrule
+O          & double [nobs$\times$nendo] & Observation selection \\
+id\_obs    & integer vector           & Indices of the observed variables \\
+id\_fwrd   & integer vector           & Indices of the forward variables \\
+nfwrd      & integer                  & Number of forward variables \\
+omega      & double [nfwrd$\times$nendo] & Forward selection \\
+mut\_pid, mut\_vid & integer vectors  & Parameter and variable index maps for $\xi$ \\
+rhoGN\_pid, rhoGN\_vid & integer vectors & Idem for $\delta$ \\
+mutp\_pid, mutp\_vid & integer vectors & Idem for the per-variable $\mu$ \\
+estimation & logical                  & Set when the estimation objects are built \\
+\bottomrule
+\end{longtable}
+
+
+%================================================================
+%  APPENDIX
+%================================================================
+\appendix
+
+\section{Internal architecture}
+\label{app:architecture}
+
+\subsection{Package map}
+\label{app:architecture:map}
+
+\file{+learning} holds what is shared between mechanisms, and one sub-package
+per mechanism.
+
+\begin{longtable}{>{\ttfamily\small}p{5.5cm} p{8.5cm}}
+\toprule
+\normalfont\textbf{File} & \textbf{Role} \\
+\midrule
+\endhead
+\multicolumn{2}{l}{\normalfont\textit{+learning}} \\
+\midrule
+learning\_streams.m & Build the belief and shock substreams from one seed \\
+is\_active.m        & True when a learning mechanism is configured \\
+getopt.m            & Read an optional field of an option structure, with a default. It resolves fields via \texttt{isfield} and must never be used to read a \file{.mod} parameter: a parameter is an entry of \field{M\_.param\_names}, never a field of \field{M\_}, so \texttt{learning.getopt(M\_, \ldots)} silently returns the default \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{+learning/+social --- simulation}} \\
+\midrule
+setup\_options\_SL.m & Build \field{options\_.learning.social} from the \texttt{SL\_*} parameters \\
+check\_support.m     & Reject or flag unsupported configurations \\
+warn\_wedge\_variance.m & Report \texttt{a\_VAR} shocks left with a non-zero variance while the mechanism is off; called from the dispatch, not from the package \\
+compute\_ghr.m       & Compute and validate the $R$ matrix \\
+simult\_SL.m         & Forward simulation with mutation and tournament \\
+moments\_SL.m        & Monte Carlo moments with empirical intervals \\
+disp\_moments\_SL.m  & Moment tables \\
+irf\_SL.m            & Paired Monte Carlo generalised IRFs \\
+plot\_decomp.m       & Historical decomposition plots \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{+learning/+social --- estimation}} \\
+\midrule
+setup\_learning\_estimation.m & Build the $\theta$-invariant estimation objects, run once \\
+refresh\_learning\_params.m   & Inject the current draw, hot path \\
+dsge\_likelihood\_SL.m        & Log-posterior, native signature \\
+IF\_SL.m                      & Inversion filter core \\
+store\_SL\_smoother.m         & Route the smoother payload into \field{oo\_} \\
+plot\_SL\_smoother\_results.m & Post-estimation figures \\
+\midrule
+\multicolumn{2}{l}{\normalfont\textit{+learning/+adaptive}} \\
+\midrule
+setup\_options\_AL.m  & Build \field{options\_.learning.adaptive} \\
+check\_support\_AL.m  & Rejected configurations \\
+init\_beliefs\_AL.m   & Model-consistent initial beliefs \\
+update\_beliefs\_AL.m & Constant-gain RLS updating \\
+resolve\_alm\_AL.m    & Map beliefs into the actual law of motion \\
+simult\_AL.m          & Forward simulation with belief updating \\
+moments\_AL.m         & Monte Carlo moments \\
+disp\_moments\_AL.m   & Moment tables \\
+\bottomrule
+\end{longtable}
+
+
+\subsection{Entry-point convention}
+
+Every mechanism entry point takes \texttt{(M\_, options\_, oo\_, \ldots)} and
+returns \field{oo\_}:
+
+\begin{lstlisting}[style=matlab]
+oo_ = learning.social.simult_SL(M_, options_, oo_, ee, belief_rng);
+oo_ = learning.adaptive.simult_AL(M_, options_, oo_, ee, belief_rng);
+oo_ = learning.social.moments_SL(M_, options_, oo_);
+oo_ = learning.adaptive.moments_AL(M_, options_, oo_);
+\end{lstlisting}
+
+Shock matrices are \texttt{[T x nexo]} in both packages. \texttt{simult\_AL}
+accepts a stream argument it does not use, so that the two mechanisms share one
+signature.
+
+
+\subsection{Hook points in Dynare core}
+\label{app:architecture:hooks}
+
+Two core files are modified.
+
+\paragraph{\file{stoch\_simul.m}} Five points: the option scan at the top,
+\texttt{compute\_ghr} after \texttt{resol}, the simulation block, the moments
+block and the IRF loop. The shock draw is shared between mechanisms; only the
+final dispatch differs:
+
+\begin{lstlisting}[style=matlab]
+if learning.is_active(options_)
+    id_struct   = find(diag(M_.Sigma_e) > 0);
+    cs          = get_lower_cholesky_covariance(M_.Sigma_e, ...
+                      options_.add_tiny_number_to_cholesky);
+    chol_struct = cs(id_struct, id_struct)';
+    [belief_rng, shock_rng] = learning.learning_streams( ...
+        options_.DynareRandomStreams.seed, ...
+        options_.DynareRandomStreams.algo, 'sim', 1);
+    ee = zeros(options_.periods, M_.exo_nbr);
+    ee(:, id_struct) = randn(shock_rng, options_.periods, ...
+                             numel(id_struct)) * chol_struct;
+    if learning.is_active(options_, 'social')
+        oo_ = learning.social.simult_SL(M_, options_, oo_, ee, belief_rng);
+    else
+        oo_ = learning.adaptive.simult_AL(M_, options_, oo_, ee, belief_rng);
+    end
+end
+\end{lstlisting}
+
+\noindent
+The option scan at the top of the file is the activation dispatch. It reads the
+two master switches from \field{M\_.params}.
+
+\begin{lstlisting}[style=matlab]
+idx = find(strcmp(M_.param_names, 'SL_active'), 1);
+if ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0
+    options_ = learning.social.setup_options_SL(M_, options_);
+else
+    learning.social.warn_wedge_variance(M_);
+end
+idx = find(strcmp(M_.param_names, 'AL_active'), 1);
+if ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0
+    options_ = learning.adaptive.setup_options_AL(M_, options_);
+end
+\end{lstlisting}
+
+
+
+\paragraph{\file{dynare\_estimation\_1.m}} Three points: the activation
+dispatch, the choice of the objective function and the smoother branch.
+
+\begin{lstlisting}[style=matlab]
+% activation dispatch, mirroring stoch_simul
+idx = find(strcmp(M_.param_names, 'SL_active'), 1);
+if ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0
+    options_ = learning.social.setup_learning_estimation(M_, options_, estim_params_);
+end
+\end{lstlisting}
+
+\begin{lstlisting}[style=matlab]
+% objective function
+elseif learning.is_active(options_, 'social') && ...
+        learning.getopt(options_.learning.social, 'estimation', false)
+    objective_function = str2func('learning.social.dsge_likelihood_SL');
+\end{lstlisting}
+
+\medskip
+\noindent
+Dynare reaches the classical smoother at a different point in the code:
+
+\begin{lstlisting}[style=matlab]
+if learning.is_active(options_, 'social') && ...
+        (learning.getopt(options_, 'smoother', false) || ...
+         learning.getopt(options_, 'frequentist_smoother', false))
+    [~,~,~,~,~,model_solution] = learning.social.dsge_likelihood_SL(...);
+    oo_ = learning.social.store_SL_smoother(oo_, M_, options_, model_solution);
+    learning.social.plot_SL_smoother_results(oo_, M_, options_, dataset_);
+elseif options_.frequentist_smoother
+    oo_ = save_display_classical_smoother_results(...);
+end
+\end{lstlisting}
+
+
+\subsection{Test suites}
+\label{app:architecture:tests}
+
+\file{tests/learning/social} holds seven \file{.mod} files, each Dynare file coresponds to a serie of tests, running in about eight seconds in total.
+\file{tests/learning/adaptive} holds one. Both use a shared file in
+\file{tests/learning} and are documented in a manifest per mechanism, which
+lists what each check asserts, the reference values, and what is missing. 
+
+The assertions that matter most:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Simulation--inversion round trip.} \texttt{IF\_SL} recovers the
+      shocks, the state path and the belief path produced by
+      \texttt{simult\_SL}, to $10^{-12}$.
+\item \textbf{RE limit.} With zero belief dispersion and no news, the
+      belief wedge vanishes and \texttt{simult\_SL} reproduces the native
+      \texttt{simult\_} exactly; the generalised IRFs reproduce the analytic
+      responses.
+\item \textbf{Deterministic likelihood.} Two evaluations at the same $\theta$
+      return bit-identical values.
+\item \textbf{Steady-state invariance.} Beliefs are invariant to a shift of the
+      steady state while the path shifts by exactly that amount.
+\item \textbf{Smoother dispatch.} After an estimation,
+      \field{oo\_.learning.social.smoother} exists and
+      \field{oo\_.UpdatedVariables}, which marks the native Kalman path, does
+      not.
+\item \textbf{Input guards.} Thirty-two rejected configurations on the social
+      side and nine on the adaptive one, each checked on
+      \texttt{ME.identifier} 
+\item \textbf{Selection follows the flags.} With a single
+      \texttt{SL\_learn\_VAR} left at 1, exactly one variable is learned.
+\end{itemize}
+
+\end{document}

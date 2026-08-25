@@ -1,0 +1,199 @@
+diff --git a/matlab/estimation/dynare_estimation_1.m b/matlab/estimation/dynare_estimation_1.m
+index a8ea9cbd3..c01f5ea8b 100644
+--- a/matlab/estimation/dynare_estimation_1.m
++++ b/matlab/estimation/dynare_estimation_1.m
+@@ -67,6 +67,12 @@ else
+     first_obs_nan_indicator=false;
+ end
+ 
++idx = find(strcmp(M_.param_names, 'SL_active'), 1);
++sl_active = ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0;
++if sl_active
++    options_ = learning.social.setup_learning_estimation(M_, options_, estim_params_);
++end
++
+ % Set particle filter flag.
+ if options_.order > 1
+     if options_.particle.status
+@@ -110,6 +116,9 @@ if ~options_.dsge_var
+     else
+         if options_.occbin.likelihood.status && options_.occbin.likelihood.inversion_filter
+             objective_function = str2func('occbin.IVF_posterior');
++        elseif learning.is_active(options_, 'social') && ...
++                learning.getopt(options_.learning.social, 'estimation', false)
++            objective_function = str2func('learning.social.dsge_likelihood_SL');
+         elseif options_.conditional_likelihood.status && options_.conditional_likelihood.order==1
+             objective_function = str2func('dsge_conditional_likelihood_1');
+         else
+@@ -187,6 +196,17 @@ if isequal(options_.mode_compute,0) && isempty(options_.mode_file) && ~options_.
+                     options_.nk=options_nk;
+                     oo_.dr=model_solution.dr; %required for subsequent call of forecasts.run
+                 end
++            
++            elseif learning.is_active(options_, 'social') && ...
++                    learning.getopt(options_.learning.social, 'estimation', false)
++                [~,~,~,~,~,model_solution] = learning.social.dsge_likelihood_SL(xparam1, dataset_, ...
++                    dataset_info, options_, M_, estim_params_, Prior, ...
++                    prior_bounds(Prior,options_.prior_trunc), oo_.dr, oo_.steady_state, ...
++                    oo_.exo_steady_state, oo_.exo_det_steady_state, smoother_info, [], []);
++                oo_ = learning.social.store_SL_smoother(oo_, M_, options_, model_solution);
++                learning.social.plot_SL_smoother_results(oo_, M_, options_, dataset_);
++                
++                oo_.dr = model_solution.dr;
+             else
+                 if options_.occbin.smoother.status
+                     [smoother_results, occbin_info] = ...
+@@ -600,9 +620,18 @@ elseif options_.partial_information ||...
+     options_.order>1 %no particle smoother
+     % smoothing not yet supported
+ else
+-    %% Frequentist smoother: ML estimation, or posterior mode without Metropolis-Hastings or Metropolis without Bayesian smoothed variables
+-    if options_.frequentist_smoother
+-        oo_=save_display_classical_smoother_results(xparam1,M_,oo_,options_,dataset_,dataset_info,estim_params_,smoother_info);
++    %% Frequentist smoother: ML / posterior mode without MH
++    if learning.is_active(options_, 'social') && ...
++        learning.getopt(options_.learning.social, 'estimation', false) && ...
++        learning.getopt(options_, 'frequentist_smoother', false)
++        [~,~,~,~,~,model_solution] = learning.social.dsge_likelihood_SL(xparam1, dataset_, ...
++            dataset_info, options_, M_, estim_params_, Prior, ...
++            prior_bounds(Prior,options_.prior_trunc), oo_.dr, oo_.steady_state, ...
++            oo_.exo_steady_state, oo_.exo_det_steady_state, smoother_info, [], []);
++        oo_ = learning.social.store_SL_smoother(oo_, M_, options_, model_solution);
++        learning.social.plot_SL_smoother_results(oo_, M_, options_, dataset_);
++    elseif options_.frequentist_smoother
++        oo_ = save_display_classical_smoother_results(xparam1,M_,oo_,options_,dataset_,dataset_info,estim_params_,smoother_info);
+     end
+ end
+ 
+diff --git a/matlab/stochastic_solver/stoch_simul.m b/matlab/stochastic_solver/stoch_simul.m
+index b680a37e1..864217bcf 100644
+--- a/matlab/stochastic_solver/stoch_simul.m
++++ b/matlab/stochastic_solver/stoch_simul.m
+@@ -44,13 +44,34 @@ if ismember(options_.solve_algo,[10,11])
+     error('stoch_simul:: perturbation solutions are not compatible with mixed complementarity problems and their solvers')
+ end
+ 
++idx = find(strcmp(M_.param_names, 'SL_active'), 1);
++sl_active = ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0;
++idx = find(strcmp(M_.param_names, 'AL_active'), 1);
++al_active = ~isempty(idx) && isfinite(M_.params(idx)) && M_.params(idx) ~= 0;
++
++if sl_active && al_active
++    error('learning:bothActive', ...
++        'SL_active and AL_active are both set: only one learning mechanism can be active.');
++end
++if sl_active
++    options_ = learning.social.setup_options_SL(M_, options_);
++elseif al_active
++    options_ = learning.adaptive.setup_options_AL(M_, options_);
++end
++
++if ~sl_active && any(startsWith(M_.param_names, 'SL_'))
++    learning.social.warn_wedge_variance(M_);
++end
++
++
+ test_for_deep_parameters_calibration(M_);
+ 
+ options_old = options_;
+ if options_.linear
+     options_.order = 1;
+ end
+-if options_.order == 1
++
++if options_.order == 1 && ~learning.is_active(options_)
+     options_.replic = 1;
+ end
+ 
+@@ -120,6 +141,10 @@ if info(1)
+     return
+ end
+ 
++if learning.is_active(options_, 'social')
++    oo_ = learning.social.compute_ghr(M_, options_, oo_);
++end
++
+ if ~options_.noprint
+     if ~options_.nomodelsummary
+         skipline()
+@@ -226,13 +251,51 @@ if options_.periods > 0 && ~PI_PCL_solver
+             y0 = oo_.histval.endo;
+         end
+     end
+-    M_.csn = csn_update_specification(M_.Sigma_e, M_.Skew_e);
+-    [oo_.endo_simul, oo_.exo_simul] = simult(y0,oo_.dr,M_,options_);
+-end
+ 
++    if learning.is_active(options_)
++        
++        id_struct = find(diag(M_.Sigma_e) > 0);
++        cs        = get_lower_cholesky_covariance(M_.Sigma_e, options_.add_tiny_number_to_cholesky);
++        chol_struct = cs(id_struct, id_struct)';
++
++        base_seed = options_.DynareRandomStreams.seed;
++        algo      = options_.DynareRandomStreams.algo;
++        [belief_rng, shock_rng] = learning.learning_streams(base_seed, algo, 'sim', 1);
++
++        ee = zeros(options_.periods, M_.exo_nbr);
++        ee(:, id_struct) = randn(shock_rng, options_.periods, numel(id_struct)) * chol_struct;
++
++        if learning.is_active(options_,'social')
++            oo_ = learning.social.simult_SL(M_, options_, oo_, ee, belief_rng);
++        else 
++            oo_ = learning.adaptive.simult_AL(M_, options_, oo_, ee, belief_rng);
++        end
++        
++         
++    else
++        M_.csn = csn_update_specification(M_.Sigma_e, M_.Skew_e);
++        [oo_.endo_simul, oo_.exo_simul] = simult(y0, oo_.dr, M_, options_);
++    end
++end
+ if ~options_.nomoments
+     if PI_PCL_solver
+         oo_=PCL_Part_info_moments(M_, oo_, options_, PCL_varobs, oo_.dr, i_var);
++
++    elseif learning.is_active(options_, 'social')
++        if options_.periods > 0
++            oo_ = learning.social.moments_SL(M_, options_, oo_);
++        else
++            error(['stoch_simul:: Social Learning moments require a simulation ' ...
++                   'horizon. Set periods>0, or use nomoments to skip them.'])
++        end
++    elseif learning.is_active(options_, 'adaptive')
++        if options_.periods > 0
++            oo_ = learning.adaptive.moments_AL(M_, options_, oo_);
++        else
++            error(['stoch_simul:: Adaptive Learning moments require a simulation ' ...
++                'horizon. Set periods>0, or use nomoments to skip them.'])
++        end
++        
+     elseif options_.periods == 0
+         if options_.order == 1 || (options_.order == 2 && ~options_.pruning)
+             oo_=disp_th_moments(oo_.dr,var_list,M_,options_,oo_);
+@@ -264,10 +327,17 @@ if options_.irf
+     if TeX
+         titTeX = M_.exo_names_tex;
+     end
++    if learning.is_active(options_, 'adaptive')
++        warning(' AL IRF not yet implemented, standard RE IRF will run');
++    end
+     irf_shocks_indx = getIrfShocksIndx(M_, options_);
+     for i=irf_shocks_indx
+         if cs(i,i) > 5e-7
+-            if PI_PCL_solver
++            if learning.is_active(options_, 'social')
++                fprintf('IRF MC simulation running on shock: %s\n\n', M_.exo_names{i})
++                [y, oo_] = learning.social.irf_SL(M_, options_, oo_, i);
++                
++            elseif PI_PCL_solver
+                 y=PCL_Part_info_irf (0, PCL_varobs, i_var, M_, oo_.dr, options_.irf, i);
+             else
+                 if options_.order>1 && options_.relative_irf % normalize shock to 0.01 before IRF generation for GIRFs; multiply with 100 later
+@@ -441,4 +511,4 @@ options_ = options_old;
+ % temporary fix waiting for local options
+ options_.partial_information = 0;
+ 
+-oo_.gui.ran_stoch_simul = true;
++oo_.gui.ran_stoch_simul = true;
+\ No newline at end of file
